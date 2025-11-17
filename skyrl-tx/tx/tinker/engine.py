@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel
-from sqlmodel import create_engine, Session, select, func
+from sqlmodel import create_engine, Session, select, update, func
 
 import jax
 import jax.numpy as jnp
@@ -123,7 +123,7 @@ class TinkerEngine:
 
             # Split model into LoRA and non-LoRA parameters
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
-            update_adapter_config(self.model, adapter_index=0, lora_rank=1, lora_alpha=1.0)
+            update_adapter_config(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0))
 
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
@@ -407,6 +407,7 @@ class TinkerEngine:
             .where(FutureDB.status == RequestStatus.PENDING)
             .where(FutureDB.request_type != types.RequestType.FORWARD_BACKWARD)
             .where(FutureDB.request_type != types.RequestType.SAMPLE)
+            .where(FutureDB.request_type != types.RequestType.EXTERNAL)
             .order_by(FutureDB.request_id)
         )
         other_futures = session.exec(statement).all()
@@ -421,17 +422,16 @@ class TinkerEngine:
         if adapter_index >= self.config.max_lora_adapters:
             raise ValueError(f"Maximum number of LoRA adapters ({self.config.max_lora_adapters}) reached")
 
-        # Extract LoRA rank and alpha from config
-        lora_rank = request_data.lora_config.rank
-        lora_alpha = request_data.lora_config.alpha
+        # Extract LoRA configuration
+        lora_config = request_data.lora_config
 
         # Validate rank doesn't exceed max
-        if not (0 < lora_rank <= self.config.max_lora_rank):
-            raise ValueError(f"LoRA rank {lora_rank} must be between 1 and {self.config.max_lora_rank}")
+        if not (0 < lora_config.rank <= self.config.max_lora_rank):
+            raise ValueError(f"LoRA rank {lora_config.rank} must be between 1 and {self.config.max_lora_rank}")
 
         self.models[model_id] = types.ModelMetadata(
             adapter_index=adapter_index,
-            lora_config=request_data.lora_config,
+            lora_config=lora_config,
         )
         self.accumulated_grads[model_id] = AccumulatedGradients()
 
@@ -441,11 +441,9 @@ class TinkerEngine:
             self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.model.is_lora_param)
 
         # Update the adapter's rank and scaling in all LoRA layers
-        update_adapter_config(self.model, adapter_index, lora_rank, lora_alpha)
+        update_adapter_config(self.model, adapter_index, lora_config)
 
-        logger.info(
-            f"Created LoRA model {model_id} with adapter index {adapter_index}, rank {lora_rank}, alpha {lora_alpha}"
-        )
+        logger.info(f"Created LoRA model {model_id} with adapter index {adapter_index}, config {lora_config}")
 
         return types.CreateModelOutput(
             model_id=model_id,
@@ -797,11 +795,13 @@ class TinkerEngine:
 
         # Make sure the user cannot store checkpoints in places like ../../<important file>
         checkpoint_id = Path(request_data.path).name
-        output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
+        output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
             # Save the LoRA adapter weights and LoRA config as tar.gz
-            save_lora_checkpoint(self.model, lora_model.lora_config, lora_model.adapter_index, output_path)
+            save_lora_checkpoint(
+                self.model, self.config.base_model, lora_model.lora_config, lora_model.adapter_index, output_path
+            )
 
             logger.info(
                 f"Saved LoRA adapter weights for model {model_id} (adapter {lora_model.adapter_index}) to {output_path}"
@@ -825,32 +825,36 @@ class TinkerEngine:
         adapter_indices_list = []
 
         for _, (model_id, request_data) in requests.items():
-            if request_data.base_model is None:
+            base_model = request_data.base_model
+            checkpoint_id = request_data.checkpoint_id
+            if base_model is None:
                 # This code path is for sampling from a LoRA adapter
-                assert request_data.checkpoint_id != "", "checkpoint_id must be not empty"
+                assert checkpoint_id != "", "checkpoint_id must be not empty"
 
                 adapter_index = self.models[model_id].adapter_index
-                if self.models[model_id].loaded_checkpoint_id == request_data.checkpoint_id:
+                if self.models[model_id].loaded_checkpoint_id == checkpoint_id:
                     # Load model from RAM
                     adapter_indices_list.append(adapter_index)
                 else:
                     # Load model from disk
                     assert adapter_index not in adapter_indices_list, "Cannot override already used adapter"
 
-                    checkpoint_path = self.config.checkpoints_base / model_id / f"{request_data.checkpoint_id}.tar.gz"
+                    checkpoint_path = (
+                        self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+                    )
                     logger.info(f"Loading LoRA sampler checkpoint from {checkpoint_path}")
                     load_lora_checkpoint(self.model, adapter_index, checkpoint_path)
 
-                    self.models[model_id].loaded_checkpoint_id = request_data.checkpoint_id
+                    self.models[model_id].loaded_checkpoint_id = checkpoint_id
                     logger.info(f"Loaded LoRA sampler weights for model {model_id} at adapter index {adapter_index}")
                     adapter_indices_list.append(adapter_index)
             else:
                 # This code path is for sampling from the base model
-                if request_data.base_model != self.config.base_model:
+                if base_model != self.config.base_model:
                     raise ValueError(
-                        f"Requested base_model '{request_data.base_model}' does not match engine's base_model '{self.config.base_model}'"
+                        f"Requested base_model '{base_model}' does not match engine's base_model '{self.config.base_model}'"
                     )
-                assert model_id == "" and request_data.checkpoint_id == ""
+                assert model_id == "" and checkpoint_id == ""
                 adapter_indices_list.append(0)
 
         return jnp.array(adapter_indices_list, dtype=jnp.int32)
@@ -861,20 +865,19 @@ class TinkerEngine:
         Args:
             results: Dict mapping request_id to result (Pydantic BaseModel)
         """
-        with Session(self.db_engine) as session:
-            for request_id, result in results.items():
-                future = session.get(FutureDB, request_id)
-                assert future is not None, f"Future with request_id {request_id} not found in database"
+        completed_at = datetime.now(timezone.utc)
+        params = [
+            {
+                "request_id": int(request_id),
+                "result_data": result.model_dump(),
+                "status": RequestStatus.FAILED if isinstance(result, types.ErrorResponse) else RequestStatus.COMPLETED,
+                "completed_at": completed_at,
+            }
+            for request_id, result in results.items()
+        ]
 
-                result_data = result.model_dump()
-                future.result_data = result_data
-                future.status = (
-                    RequestStatus.FAILED if isinstance(result, types.ErrorResponse) else RequestStatus.COMPLETED
-                )
-                future.completed_at = datetime.now(timezone.utc)
-                session.add(future)
-                if future.status == RequestStatus.COMPLETED:
-                    logger.info(f"Completed {future.request_type} request {request_id}")
+        with Session(self.db_engine) as session:
+            session.execute(update(FutureDB), params)
             session.commit()
 
     def process_single_request(self, request_type: types.RequestType, model_id: str, request_data: dict) -> BaseModel:
