@@ -415,13 +415,14 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         return generator_output
 
-    async def generate(self, input_batch: GeneratorInput) -> GeneratorOutput:
+    async def generate(self, input_batch: GeneratorInput, disable_tqdm: bool = False) -> GeneratorOutput:
         """
         Generate trajectories for the input batch.
 
         Returns outputs in the same order as the input batch.
         Args:
             input_batch: GeneratorInput
+            disable_tqdm: bool
         Returns:
             GeneratorOutput
         """
@@ -458,6 +459,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             desc="Generating Trajectories",
             miniters=max(1, len(tasks) // 10),
             mininterval=5,
+            disable=disable_tqdm,
         )
 
         responses = [output.response_ids for output in all_outputs]
@@ -627,7 +629,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             # first `\n` is generated since we stripped it in ``base_conversation_token_ids``.
             observation_ids = self.tokenizer.apply_chat_template(
                 [*self.base_conversation, *new_obs],
-                add_generation_prompt=True,
+                add_generation_prompt=not done,
                 tokenize=True,
                 **self.generator_cfg.chat_template_kwargs,
             )[len(self.base_conversation_token_ids) :]

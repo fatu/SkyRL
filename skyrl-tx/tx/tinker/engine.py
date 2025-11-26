@@ -10,6 +10,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from sqlmodel import create_engine, Session, select, update, func
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -43,6 +44,15 @@ from tx.utils.log import logger
 def pad(xs, pad_to: int, *, fill):
     """Pad a list to a specified length with a fill value."""
     return xs + ([fill] * (pad_to - len(xs)))
+
+
+def pad_batch(sequences: list[list], max_length: int, dtype) -> jax.Array:
+    """Pad a batch of sequences to max_length."""
+    batch_size = len(sequences)
+    padded = np.zeros((batch_size, max_length), dtype=dtype)
+    for i, seq in enumerate(sequences):
+        padded[i, : len(seq)] = seq
+    return jnp.asarray(padded)
 
 
 @dataclass
@@ -130,6 +140,18 @@ class TinkerEngine:
         )
 
         self._create_loss_and_grad_fn()
+
+    def _extract_checkpoint_data(self, model_id: str) -> dict:
+        """Extract adapter state and optimizer state for checkpointing."""
+        adapter_index = self.models[model_id].adapter_index
+        rank = self.models[model_id].lora_config.rank
+        lora_weights = extract_adapter_state(adapter_index, self.lora_params, rank)
+        optimizer_state = extract_adapter_state(adapter_index, nnx.state(self.optimizers[model_id]), rank)
+        return {
+            "lora_weights": lora_weights,
+            "optimizer_state": optimizer_state,
+            "lora_config": self.models[model_id].lora_config.model_dump(),
+        }
 
     @contextmanager
     def _checkpoint_status_context(self, model_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType):
@@ -500,19 +522,16 @@ class TinkerEngine:
         # Pad sequences to same length. Also bin it so the JIT has to compile fewer kernels.
         max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids))
 
-        input_ids = jnp.array([pad(seq, max_len, fill=0) for seq in all_input_ids], dtype=jnp.int32)
-        target_ids = jnp.array([pad(seq, max_len, fill=0) for seq in all_targets], dtype=jnp.int32)
+        input_ids = pad_batch(all_input_ids, max_len, np.int32)
+        target_ids = pad_batch(all_targets, max_len, np.int32)
         adapter_indices = jnp.array(all_adapter_indices, dtype=jnp.int32)
         loss_fn_types = jnp.array(all_loss_fn_types, dtype=jnp.int32)
 
         # Create attention mask (1 for real tokens, 0 for padding)
-        attention_mask = jnp.array([pad([1] * len(seq), max_len, fill=0) for seq in all_input_ids], dtype=jnp.int32)
-        loss_mask = jnp.array(
-            [pad(all_token_weights[i], max_len, fill=0) for i in range(len(all_token_weights))],
-            dtype=jnp.float32,
-        )
-        sampling_logprobs = jnp.array([pad(seq, max_len, fill=0.0) for seq in all_sampling_logprobs], dtype=jnp.float32)
-        advantages = jnp.array([pad(seq, max_len, fill=0.0) for seq in all_advantages], dtype=jnp.float32)
+        attention_mask = pad_batch([[1] * len(seq) for seq in all_input_ids], max_len, np.int32)
+        loss_mask = pad_batch(all_token_weights, max_len, np.float32)
+        sampling_logprobs = pad_batch(all_sampling_logprobs, max_len, np.float32)
+        advantages = pad_batch(all_advantages, max_len, np.float32)
 
         total_bs = int(input_ids.shape[0])
         micro_bs = self._micro_batch_size(total_bs)
@@ -622,7 +641,6 @@ class TinkerEngine:
         max_batch_size = (
             self.config.sample_max_num_sequences if self.config.sample_max_num_sequences > 0 else total_batch_size
         )
-
         # Collect generated sequences across batches
         all_sequences: list[types.GeneratedSequence] = []
 
@@ -631,32 +649,23 @@ class TinkerEngine:
             for batch_start in range(0, total_batch_size, max_batch_size):
                 batch_end = min(batch_start + max_batch_size, total_batch_size)
                 batch_prompts = pad(all_prompts[batch_start:batch_end], max_batch_size, fill=[])
+                adapter_indices = pad(all_adapter_indices[batch_start:batch_end], max_batch_size, fill=0)
+                sampling_params = pad(
+                    all_sampling_params[batch_start:batch_end], max_batch_size, fill=all_sampling_params[batch_start]
+                )
 
                 # Pad sequences to same length within the batch to minimize memory usage.
                 # Also bin it so the JIT has to compile fewer kernels.
                 max_len = round_up_seq_len(max((len(seq) for seq in batch_prompts), default=0))
-                input_ids = jnp.array(
-                    [pad(seq, max_len, fill=0) for seq in batch_prompts],
-                    dtype=jnp.int32,
-                )
-                attention_mask = jnp.array(
-                    [pad([1] * len(seq), max_len, fill=0) for seq in batch_prompts],
-                    dtype=jnp.int32,
-                )
-                adapter_indices = jnp.array(
-                    pad(all_adapter_indices[batch_start:batch_end], max_batch_size, fill=0),
-                    dtype=jnp.int32,
-                )
-                sampling_params = pad(
-                    all_sampling_params[batch_start:batch_end], max_batch_size, fill=all_sampling_params[batch_start]
-                )
+                input_ids = pad_batch(batch_prompts, max_len, np.int32)
+                attention_mask = pad_batch([[1] * len(seq) for seq in batch_prompts], max_len, np.int32)
 
                 with self._jit_timing_context(max_len, mode="sample"):
                     result = model.generate(
                         input_ids,
                         attention_mask,
                         sampling_params=sampling_params,
-                        adapter_indices=adapter_indices,
+                        adapter_indices=jnp.array(adapter_indices, dtype=jnp.int32),
                     )
                 # Only take the actual results, not the padded ones
                 batch_size = batch_end - batch_start
@@ -725,23 +734,23 @@ class TinkerEngine:
         )
 
         with download_and_unpack(checkpoint_dir) as temp_dir:
-            restored_data = checkpoints.restore_checkpoint(ckpt_dir=temp_dir, target=None, prefix="checkpoint_")
+            checkpoint = checkpoints.restore_checkpoint(
+                ckpt_dir=temp_dir, target=self._extract_checkpoint_data(model_id), prefix="checkpoint_"
+            )
 
-        if restored_data is None:
+        if checkpoint is None:
             raise FileNotFoundError(f"Training checkpoint not found in {checkpoint_dir}")
 
         # Validate rank
-        rank = restored_data["lora_config"]["rank"]
+        rank = checkpoint["lora_config"]["rank"]
         if self.models[model_id].lora_config.rank != rank:
             raise ValueError(
                 f"Rank mismatch: checkpoint has rank {rank}, model configured with rank {self.models[model_id].lora_config.rank}"
             )
 
         # Update both LoRA weights and optimizer state
-        insert_adapter_state(adapter_index, self.lora_params, self.non_lora_params, restored_data["lora_weights"])
-        insert_adapter_state(
-            adapter_index, nnx.state(self.optimizers[model_id]), self.non_lora_params, restored_data["optimizer_state"]
-        )
+        insert_adapter_state(adapter_index, self.lora_params, checkpoint["lora_weights"], rank)
+        insert_adapter_state(adapter_index, nnx.state(self.optimizers[model_id]), checkpoint["optimizer_state"], rank)
 
         logger.info(f"Loaded training checkpoint for model {model_id} from {checkpoint_dir}")
         return types.LoadWeightsOutput(type="load_weights")
@@ -754,23 +763,13 @@ class TinkerEngine:
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
-        adapter_index = self.models[model_id].adapter_index
         checkpoint_id = request_data.path
         output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
-            adapter_lora_params = extract_adapter_state(adapter_index, self.lora_params, self.non_lora_params)
-            optimizer_params = extract_adapter_state(
-                adapter_index, nnx.state(self.optimizers[model_id]), self.non_lora_params
-            )
-
             with pack_and_upload(output_path) as temp_dir:
                 checkpoints.save_checkpoint(
-                    target={
-                        "lora_weights": nnx.to_pure_dict(adapter_lora_params),
-                        "optimizer_state": nnx.to_pure_dict(optimizer_params),
-                        "lora_config": self.models[model_id].lora_config.model_dump(),
-                    },
+                    target=self._extract_checkpoint_data(model_id),
                     ckpt_dir=temp_dir,
                     step=0,
                     prefix="checkpoint_",
@@ -812,7 +811,7 @@ class TinkerEngine:
             type="save_weights_for_sampler",
         )
 
-    def load_sampler_weights(self, requests: dict[str, tuple[str, types.SampleInput]]) -> jax.Array:
+    def load_sampler_weights(self, requests: dict[str, tuple[str, types.SampleInput]]) -> list[int]:
         """Load sampler weights for all requests and return full adapter indices array.
 
         Args:
@@ -822,7 +821,7 @@ class TinkerEngine:
             The adapter_indices array for LoRA sampling [batch_size]
             Uses adapter index 0 for base model sampling (no LoRA)
         """
-        adapter_indices_list = []
+        adapter_indices = []
 
         for _, (model_id, request_data) in requests.items():
             base_model = request_data.base_model
@@ -834,20 +833,21 @@ class TinkerEngine:
                 adapter_index = self.models[model_id].adapter_index
                 if self.models[model_id].loaded_checkpoint_id == checkpoint_id:
                     # Load model from RAM
-                    adapter_indices_list.append(adapter_index)
+                    adapter_indices.append(adapter_index)
                 else:
                     # Load model from disk
-                    assert adapter_index not in adapter_indices_list, "Cannot override already used adapter"
+                    assert adapter_index not in adapter_indices, "Cannot override already used adapter"
 
                     checkpoint_path = (
                         self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
                     )
                     logger.info(f"Loading LoRA sampler checkpoint from {checkpoint_path}")
-                    load_lora_checkpoint(self.model, adapter_index, checkpoint_path)
+                    adapter_config = self.models[model_id].lora_config
+                    load_lora_checkpoint(self.model, adapter_config, adapter_index, checkpoint_path)
 
                     self.models[model_id].loaded_checkpoint_id = checkpoint_id
                     logger.info(f"Loaded LoRA sampler weights for model {model_id} at adapter index {adapter_index}")
-                    adapter_indices_list.append(adapter_index)
+                    adapter_indices.append(adapter_index)
             else:
                 # This code path is for sampling from the base model
                 if base_model != self.config.base_model:
@@ -855,9 +855,9 @@ class TinkerEngine:
                         f"Requested base_model '{base_model}' does not match engine's base_model '{self.config.base_model}'"
                     )
                 assert model_id == "" and checkpoint_id == ""
-                adapter_indices_list.append(0)
+                adapter_indices.append(0)
 
-        return jnp.array(adapter_indices_list, dtype=jnp.int32)
+        return adapter_indices
 
     def _complete_futures(self, results: dict[str, BaseModel]):
         """Helper method to complete multiple futures in the database.
